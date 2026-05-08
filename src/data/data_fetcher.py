@@ -1203,30 +1203,50 @@ class YFinanceFetcher(BaseDataFetcher, DataSource):
         ticker_list = tickers['tickers'].astype(str).tolist() if isinstance(tickers, pd.DataFrame) else list(tickers)
         all_rows: List[Dict[str, Any]] = []
         end_plus = (pd.to_datetime(end_date) + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+
         for tic in ticker_list:
             try:
                 yf_ticker = str(tic).replace('.', '-')
                 hist = yf.download(yf_ticker, start=start_date, end=end_plus, auto_adjust=False, progress=False)
                 if hist is None or hist.empty:
                     continue
+
+                if isinstance(hist.columns, pd.MultiIndex):
+                    hist.columns = [col[0] if isinstance(col, tuple) else col for col in hist.columns]
+
                 hist = hist.reset_index()
-                for _, row in hist.iterrows():
-                    all_rows.append({
-                        'gvkey': tic,
-                        'datadate': row['Date'],
-                        'tic': tic,
-                        'prccd': row.get('Close', np.nan),
-                        'prcod': row.get('Open', np.nan),
-                        'prchd': row.get('High', np.nan),
-                        'prcld': row.get('Low', np.nan),
-                        'cshtrd': row.get('Volume', np.nan),
-                        'adj_close': row.get('Adj Close', row.get('Close', np.nan)),
-                    })
+                if 'Date' not in hist.columns and 'Datetime' in hist.columns:
+                    hist = hist.rename(columns={'Datetime': 'Date'})
+                if 'Date' not in hist.columns:
+                    logger.warning(f"yfinance price data missing date column for {tic}")
+                    continue
+
+                numeric_cols = ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
+                for col in numeric_cols:
+                    if col in hist.columns:
+                        hist[col] = pd.to_numeric(hist[col], errors='coerce')
+
+                rows = pd.DataFrame({
+                    'gvkey': tic,
+                    'datadate': pd.to_datetime(hist['Date'], errors='coerce'),
+                    'tic': tic,
+                    'prccd': hist.get('Close', np.nan),
+                    'prcod': hist.get('Open', np.nan),
+                    'prchd': hist.get('High', np.nan),
+                    'prcld': hist.get('Low', np.nan),
+                    'cshtrd': hist.get('Volume', np.nan),
+                    'adj_close': hist.get('Adj Close', hist.get('Close', np.nan)),
+                }).dropna(subset=['datadate'])
+
+                if not rows.empty:
+                    all_rows.extend(rows.to_dict('records'))
             except Exception as e:
                 logger.warning(f"yfinance price fetch failed for {tic}: {e}")
+
         if all_rows:
             df = self._standardize_price_data(pd.DataFrame(all_rows))
             self.data_store.save_price_data(df)
+
         return self.data_store.get_price_data(ticker_list, start_date, end_date)
 
     def get_fundamental_data(self, tickers: pd.DataFrame, start_date: str, end_date: str, align_quarter_dates: bool = False) -> pd.DataFrame:
