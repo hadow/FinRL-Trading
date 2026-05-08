@@ -1271,35 +1271,56 @@ class YFinanceFetcher(BaseDataFetcher, DataSource):
     def get_fundamental_data(self, tickers: pd.DataFrame, start_date: str, end_date: str, align_quarter_dates: bool = False) -> pd.DataFrame:
         start_dt = pd.to_datetime(start_date)
         end_dt = pd.to_datetime(end_date)
-        prices = self.get_price_data(tickers, (start_dt - pd.DateOffset(months=4)).strftime('%Y-%m-%d'), end_date)
+        extended_end_dt = min(end_dt + pd.DateOffset(months=3), pd.Timestamp.today().normalize())
+
+        prices = self.get_price_data(
+            tickers,
+            (start_dt - pd.DateOffset(months=4)).strftime('%Y-%m-%d'),
+            extended_end_dt.strftime('%Y-%m-%d')
+        )
         records: List[Dict[str, Any]] = []
+
         for ticker in tickers['tickers'].astype(str).tolist():
             try:
                 yt = yf.Ticker(ticker.replace('.', '-'))
                 income = yt.quarterly_financials.T if hasattr(yt, 'quarterly_financials') else pd.DataFrame()
                 balance = yt.quarterly_balance_sheet.T if hasattr(yt, 'quarterly_balance_sheet') else pd.DataFrame()
                 cashflow = yt.quarterly_cashflow.T if hasattr(yt, 'quarterly_cashflow') else pd.DataFrame()
+
                 idx = sorted(set(income.index) | set(balance.index) | set(cashflow.index))
+                if not idx:
+                    continue
+
                 prices_t = prices[prices['tic'] == ticker].copy()
                 if not prices_t.empty:
                     prices_t['datadate'] = pd.to_datetime(prices_t['datadate'], errors='coerce')
+                    prices_t = prices_t.dropna(subset=['datadate']).sort_values('datadate')
+
                 for qd in idx:
                     qd = pd.to_datetime(qd)
                     if qd < start_dt or qd > end_dt:
                         continue
+
                     price_row = prices_t[prices_t['datadate'] >= qd].head(1)
                     if price_row.empty:
                         price_row = prices_t[prices_t['datadate'] < qd].tail(1)
+
                     prccd = float(price_row.iloc[0]['prccd']) if not price_row.empty else np.nan
                     adj_close = float(price_row.iloc[0]['adj_close']) if not price_row.empty else np.nan
+
                     inc = income.loc[qd] if qd in income.index else pd.Series(dtype=float)
                     bal = balance.loc[qd] if qd in balance.index else pd.Series(dtype=float)
                     cf = cashflow.loc[qd] if qd in cashflow.index else pd.Series(dtype=float)
+
                     shares = bal.get('Share Issued', np.nan)
                     eps = inc.get('Diluted EPS', np.nan)
                     records.append({
-                        'gvkey': ticker, 'datadate': qd, 'tic': ticker,
-                        'prccd': prccd, 'adj_close': adj_close, 'ajexdi': 1.0,
+                        'gvkey': ticker,
+                        'datadate': qd,
+                        'tic': ticker,
+                        'prccd': prccd,
+                        'adj_close': adj_close,
+                        'ajexdi': 1.0,
                         'saleq': inc.get('Total Revenue', np.nan),
                         'niq': inc.get('Net Income', np.nan),
                         'epsfiq': eps,
@@ -1310,7 +1331,41 @@ class YFinanceFetcher(BaseDataFetcher, DataSource):
                     })
             except Exception as e:
                 logger.warning(f"yfinance fundamentals fetch failed for {ticker}: {e}")
-        return pd.DataFrame(records)
+
+        df = pd.DataFrame(records)
+        if df.empty:
+            return df
+
+        df['datadate'] = pd.to_datetime(df['datadate'], errors='coerce')
+        df = df.dropna(subset=['datadate']).sort_values(['tic', 'datadate']).reset_index(drop=True)
+
+        # Follow FMP logic: forward next-quarter return based on adjusted close.
+        df['adj_close_q'] = pd.to_numeric(df['adj_close'], errors='coerce')
+        df['y_return'] = df.groupby('tic')['adj_close_q'].transform(lambda s: np.log(s.shift(-1) / s))
+
+        # Backfill last quarter y_return using available future price data (e.g. next quarter price exists, fundamentals not yet).
+        try:
+            for tic, grp in df.groupby('tic'):
+                if grp.empty:
+                    continue
+                last_idx = grp.index[-1]
+                if pd.isna(df.loc[last_idx, 'y_return']):
+                    last_date = df.loc[last_idx, 'datadate']
+                    cur_price = df.loc[last_idx, 'adj_close_q']
+                    if pd.notna(cur_price) and cur_price > 0:
+                        p_t = prices[prices['tic'] == tic].copy()
+                        if not p_t.empty:
+                            p_t['datadate'] = pd.to_datetime(p_t['datadate'], errors='coerce')
+                            p_t = p_t.dropna(subset=['datadate']).sort_values('datadate')
+                            next_row = p_t[p_t['datadate'] > last_date].head(1)
+                            if not next_row.empty:
+                                next_price = pd.to_numeric(next_row.iloc[0].get('adj_close', np.nan), errors='coerce')
+                                if pd.notna(next_price) and next_price > 0:
+                                    df.loc[last_idx, 'y_return'] = np.log(float(next_price) / float(cur_price))
+        except Exception as e:
+            logger.warning(f"Failed to backfill y_return for yfinance fundamentals: {e}")
+
+        return df
 
 class DataSourceManager:
     """Manager for multiple data sources with automatic fallback."""
