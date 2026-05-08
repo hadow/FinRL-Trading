@@ -1159,6 +1159,120 @@ class FMPFetcher(BaseDataFetcher, DataSource):
         return final_data
 
 
+class YFinanceFetcher(BaseDataFetcher, DataSource):
+    """Yahoo Finance data fetcher."""
+
+    def __init__(self, cache_dir: str = "./data/cache"):
+        super().__init__(cache_dir)
+
+    def is_available(self) -> bool:
+        return True
+
+    def get_sp500_components(self, date: str = None) -> pd.DataFrame:
+        if date is None:
+            date = datetime.now().strftime("%Y-%m-%d")
+        cached_tickers, cached_sectors, cached_date_first_added = self.data_store.get_sp500_components(date)
+        if cached_tickers:
+            return pd.DataFrame({
+                'tickers': cached_tickers.split(","),
+                'sectors': cached_sectors.split(","),
+                'dateFirstAdded': cached_date_first_added.split(",")
+            })
+        try:
+            table = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+            table = table.rename(columns={'Symbol': 'tickers', 'GICS Sector': 'sectors'})
+            table['dateFirstAdded'] = table.get('Date first added', '').fillna('')
+            table['tickers'] = table['tickers'].astype(str).str.replace('.', '-', regex=False)
+            tickers_str = ",".join(table['tickers'].astype(str).tolist())
+            sectors_str = ",".join(table['sectors'].astype(str).tolist())
+            added_str = ",".join(table['dateFirstAdded'].astype(str).tolist())
+            self.data_store.save_sp500_components(date, tickers_str, sectors_str, added_str)
+            return table[['tickers', 'sectors', 'dateFirstAdded']]
+        except Exception as e:
+            logger.warning(f"Failed to fetch S&P 500 components from yfinance path: {e}")
+            return pd.DataFrame({'tickers': [], 'sectors': [], 'dateFirstAdded': []})
+
+    def get_news(self, ticker: str, from_date: str, to_date: str,
+                 analyze_sentiment: bool = False,
+                 sentiment_model: Optional[str] = None,
+                 force_refresh: bool = False) -> pd.DataFrame:
+        # yfinance.news lacks stable full-history date range API; return local cache only for compatibility.
+        return self.data_store.get_news_articles(ticker, from_date, to_date)
+
+    def get_price_data(self, tickers: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
+        ticker_list = tickers['tickers'].astype(str).tolist() if isinstance(tickers, pd.DataFrame) else list(tickers)
+        all_rows: List[Dict[str, Any]] = []
+        end_plus = (pd.to_datetime(end_date) + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+        for tic in ticker_list:
+            try:
+                yf_ticker = str(tic).replace('.', '-')
+                hist = yf.download(yf_ticker, start=start_date, end=end_plus, auto_adjust=False, progress=False)
+                if hist is None or hist.empty:
+                    continue
+                hist = hist.reset_index()
+                for _, row in hist.iterrows():
+                    all_rows.append({
+                        'gvkey': tic,
+                        'datadate': row['Date'],
+                        'tic': tic,
+                        'prccd': row.get('Close', np.nan),
+                        'prcod': row.get('Open', np.nan),
+                        'prchd': row.get('High', np.nan),
+                        'prcld': row.get('Low', np.nan),
+                        'cshtrd': row.get('Volume', np.nan),
+                        'adj_close': row.get('Adj Close', row.get('Close', np.nan)),
+                    })
+            except Exception as e:
+                logger.warning(f"yfinance price fetch failed for {tic}: {e}")
+        if all_rows:
+            df = self._standardize_price_data(pd.DataFrame(all_rows))
+            self.data_store.save_price_data(df)
+        return self.data_store.get_price_data(ticker_list, start_date, end_date)
+
+    def get_fundamental_data(self, tickers: pd.DataFrame, start_date: str, end_date: str, align_quarter_dates: bool = False) -> pd.DataFrame:
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+        prices = self.get_price_data(tickers, (start_dt - pd.DateOffset(months=4)).strftime('%Y-%m-%d'), end_date)
+        records: List[Dict[str, Any]] = []
+        for ticker in tickers['tickers'].astype(str).tolist():
+            try:
+                yt = yf.Ticker(ticker.replace('.', '-'))
+                income = yt.quarterly_financials.T if hasattr(yt, 'quarterly_financials') else pd.DataFrame()
+                balance = yt.quarterly_balance_sheet.T if hasattr(yt, 'quarterly_balance_sheet') else pd.DataFrame()
+                cashflow = yt.quarterly_cashflow.T if hasattr(yt, 'quarterly_cashflow') else pd.DataFrame()
+                idx = sorted(set(income.index) | set(balance.index) | set(cashflow.index))
+                prices_t = prices[prices['tic'] == ticker].copy()
+                if not prices_t.empty:
+                    prices_t['datadate'] = pd.to_datetime(prices_t['datadate'], errors='coerce')
+                for qd in idx:
+                    qd = pd.to_datetime(qd)
+                    if qd < start_dt or qd > end_dt:
+                        continue
+                    price_row = prices_t[prices_t['datadate'] >= qd].head(1)
+                    if price_row.empty:
+                        price_row = prices_t[prices_t['datadate'] < qd].tail(1)
+                    prccd = float(price_row.iloc[0]['prccd']) if not price_row.empty else np.nan
+                    adj_close = float(price_row.iloc[0]['adj_close']) if not price_row.empty else np.nan
+                    inc = income.loc[qd] if qd in income.index else pd.Series(dtype=float)
+                    bal = balance.loc[qd] if qd in balance.index else pd.Series(dtype=float)
+                    cf = cashflow.loc[qd] if qd in cashflow.index else pd.Series(dtype=float)
+                    shares = bal.get('Share Issued', np.nan)
+                    eps = inc.get('Diluted EPS', np.nan)
+                    records.append({
+                        'gvkey': ticker, 'datadate': qd, 'tic': ticker,
+                        'prccd': prccd, 'adj_close': adj_close, 'ajexdi': 1.0,
+                        'saleq': inc.get('Total Revenue', np.nan),
+                        'niq': inc.get('Net Income', np.nan),
+                        'epsfiq': eps,
+                        'ceqq': bal.get('Stockholders Equity', np.nan),
+                        'cshoq': shares,
+                        'dvy': cf.get('Cash Dividends Paid', np.nan),
+                        'gsector': tickers[tickers['tickers'] == ticker]['sectors'].iloc[0] if 'sectors' in tickers.columns and (tickers['tickers'] == ticker).any() else None
+                    })
+            except Exception as e:
+                logger.warning(f"yfinance fundamentals fetch failed for {ticker}: {e}")
+        return pd.DataFrame(records)
+
 class DataSourceManager:
     """Manager for multiple data sources with automatic fallback."""
 
@@ -1176,7 +1290,8 @@ class DataSourceManager:
 
         # Initialize data sources in priority order
         self.data_sources = [
-            ('FMP', FMPFetcher(cache_dir))
+            ('FMP', FMPFetcher(cache_dir)),
+            ('YFINANCE', YFinanceFetcher(cache_dir))
         ]
 
         # Determine best available source
