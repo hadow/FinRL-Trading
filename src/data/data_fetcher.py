@@ -13,6 +13,7 @@ import logging
 import json
 from typing import List, Optional, Dict, Any, Protocol, Tuple
 from datetime import datetime
+from io import StringIO
 from abc import ABC
 import pandas as pd
 from pathlib import Path
@@ -1171,6 +1172,7 @@ class YFinanceFetcher(BaseDataFetcher, DataSource):
     def get_sp500_components(self, date: str = None) -> pd.DataFrame:
         if date is None:
             date = datetime.now().strftime("%Y-%m-%d")
+
         cached_tickers, cached_sectors, cached_date_first_added = self.data_store.get_sp500_components(date)
         if cached_tickers:
             return pd.DataFrame({
@@ -1178,11 +1180,20 @@ class YFinanceFetcher(BaseDataFetcher, DataSource):
                 'sectors': cached_sectors.split(","),
                 'dateFirstAdded': cached_date_first_added.split(",")
             })
+
         try:
-            table = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+            sp500_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+                              '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+            }
+            response = requests.get(sp500_url, headers=headers, timeout=20)
+            response.raise_for_status()
+            table = pd.read_html(StringIO(response.text))[0]
             table = table.rename(columns={'Symbol': 'tickers', 'GICS Sector': 'sectors'})
             table['dateFirstAdded'] = table.get('Date first added', '').fillna('')
             table['tickers'] = table['tickers'].astype(str).str.replace('.', '-', regex=False)
+
             tickers_str = ",".join(table['tickers'].astype(str).tolist())
             sectors_str = ",".join(table['sectors'].astype(str).tolist())
             added_str = ",".join(table['dateFirstAdded'].astype(str).tolist())
@@ -1190,6 +1201,14 @@ class YFinanceFetcher(BaseDataFetcher, DataSource):
             return table[['tickers', 'sectors', 'dateFirstAdded']]
         except Exception as e:
             logger.warning(f"Failed to fetch S&P 500 components from yfinance path: {e}")
+            latest_tickers, latest_sectors, latest_added = self.data_store.get_sp500_components()
+            if latest_tickers:
+                logger.info("Returning latest cached S&P 500 components from database")
+                return pd.DataFrame({
+                    'tickers': latest_tickers.split(","),
+                    'sectors': latest_sectors.split(","),
+                    'dateFirstAdded': latest_added.split(",")
+                })
             return pd.DataFrame({'tickers': [], 'sectors': [], 'dateFirstAdded': []})
 
     def get_news(self, ticker: str, from_date: str, to_date: str,
