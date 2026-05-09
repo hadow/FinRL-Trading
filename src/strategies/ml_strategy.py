@@ -325,6 +325,100 @@ class MLStockSelectionStrategy(BaseStrategy):
         
         return result
 
+    def apply_risk_limits(self, weights_df: pd.DataFrame) -> pd.DataFrame:
+        """Apply basic portfolio risk constraints and re-normalize weights.
+
+        Supported config attributes (all optional):
+        - max_weight_per_stock: single-name cap (default 0.10)
+        - min_weight_per_stock: floor before final cleanup (default 0.0)
+        - max_stocks: keep top-N by weight after capping (default None)
+        - min_predicted_return: drop names below threshold if column exists (default None)
+
+        For rolling outputs, normalization is done per-date.
+        """
+        if weights_df is None or len(weights_df) == 0:
+            return weights_df.copy() if isinstance(weights_df, pd.DataFrame) else pd.DataFrame(columns=['gvkey', 'weight'])
+
+        out = weights_df.copy()
+        if 'gvkey' not in out.columns or 'weight' not in out.columns:
+            raise ValueError("weights_df 必须包含 ['gvkey', 'weight'] 列")
+
+        # Parse limits from config with safe defaults.
+        max_w = float(getattr(self.config, 'max_weight_per_stock', 0.10) or 0.10)
+        min_w = float(getattr(self.config, 'min_weight_per_stock', 0.0) or 0.0)
+        max_stocks = getattr(self.config, 'max_stocks', None)
+        min_pred = getattr(self.config, 'min_predicted_return', None)
+
+        if max_w <= 0:
+            max_w = 1.0
+        if min_w < 0:
+            min_w = 0.0
+        if min_w > max_w:
+            min_w = max_w
+
+        def _apply_group(g: pd.DataFrame) -> pd.DataFrame:
+            g = g.copy()
+            g['weight'] = pd.to_numeric(g['weight'], errors='coerce').fillna(0.0)
+            g['weight'] = g['weight'].clip(lower=0.0)
+
+            if min_pred is not None and 'predicted_return' in g.columns:
+                g = g[g['predicted_return'] >= float(min_pred)].copy()
+
+            if g.empty:
+                return g
+
+            # Keep strongest names if max_stocks is configured.
+            if max_stocks is not None:
+                try:
+                    k = int(max_stocks)
+                    if k > 0 and len(g) > k:
+                        g = g.sort_values('weight', ascending=False).head(k).copy()
+                except Exception:
+                    pass
+
+            # Normalize first.
+            total = float(g['weight'].sum())
+            if total <= 0:
+                g['weight'] = 1.0 / len(g)
+            else:
+                g['weight'] = g['weight'] / total
+
+            # Iterative cap-and-redistribute for long-only portfolio.
+            for _ in range(10):
+                over = g['weight'] > max_w
+                if not over.any():
+                    break
+                excess = float((g.loc[over, 'weight'] - max_w).sum())
+                g.loc[over, 'weight'] = max_w
+                under = g['weight'] < max_w
+                under_total = float(g.loc[under, 'weight'].sum())
+                if under_total > 0 and excess > 0:
+                    g.loc[under, 'weight'] += g.loc[under, 'weight'] / under_total * excess
+
+            # Apply floor and renormalize.
+            if min_w > 0:
+                g['weight'] = g['weight'].clip(lower=min_w)
+
+            g = g[g['weight'] > 0].copy()
+            if g.empty:
+                return g
+
+            g['weight'] = g['weight'] / g['weight'].sum()
+
+            # If all positions hit max cap and sum < 1 edge-case, fallback equal.
+            if not np.isfinite(g['weight']).all() or g['weight'].sum() <= 0:
+                g['weight'] = 1.0 / len(g)
+
+            # Preserve input ordering as much as possible
+            return g
+
+        if 'date' in out.columns:
+            out = out.groupby('date', group_keys=False).apply(_apply_group).reset_index(drop=True)
+        else:
+            out = _apply_group(out).reset_index(drop=True)
+
+        return out
+
 
     def _build_candidate_models(self) -> Dict[str, Any]:
         """Build candidate models similar to ml_model.py (rf/gbm, optional xgb/lgbm)."""
