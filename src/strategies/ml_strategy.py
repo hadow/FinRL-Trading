@@ -448,9 +448,10 @@ class MLStockSelectionStrategy(BaseStrategy):
                 n_jobs=-1,
                 verbose=-1
             )
-        except Exception:
-            logger.warning("LightGBM not installed, skipping. Please install LightGBM to use this model.")
-            pass
+        except ImportError:
+            logger.warning("LightGBM import failed (package not available in current runtime), skipping.")
+        except Exception as e:
+            logger.warning(f"LightGBM is installed but unavailable in current runtime, skipping: {e}")
 
         # Optional XGBoost
         try:
@@ -464,9 +465,10 @@ class MLStockSelectionStrategy(BaseStrategy):
                 random_state=42,
                 n_jobs=0
             )
-        except Exception:
-            logger.warning("XGBoost not installed, skipping. Please install XGBoost to use this model.")
-            pass
+        except ImportError:
+            logger.warning("XGBoost import failed (package not available in current runtime), skipping.")
+        except Exception as e:
+            logger.warning(f"XGBoost is installed but unavailable in current runtime, skipping: {e}")
 
         return candidates
 
