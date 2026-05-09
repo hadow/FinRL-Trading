@@ -16,6 +16,7 @@ class StrategyResult:
 @dataclass
 class StrategyConfig:
     name: str = "BaseStrategy"
+    description:str=''
 
 class BaseStrategy:
     """Minimal base strategy interface."""
