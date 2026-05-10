@@ -1557,7 +1557,7 @@ def get_all_historical_sp500_tickers(csv_path: str = None,
 
 
 def fetch_fundamental_data(tickers: List[str] | pd.DataFrame, start_date: str, end_date: str,
-                          align_quarter_dates: bool = False, preferred_source='FMP') -> pd.DataFrame:
+                          align_quarter_dates: bool = False, preferred_source='YFINANCE') -> pd.DataFrame:
     """
     Fetch fundamental data for tickers.
     
