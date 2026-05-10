@@ -341,6 +341,13 @@ class MLStockSelectionStrategy(BaseStrategy):
             return weights_df.copy() if isinstance(weights_df, pd.DataFrame) else pd.DataFrame(columns=['gvkey', 'weight'])
 
         out = weights_df.copy()
+
+        # 一些调用链会把 date 放在索引里，这里统一还原为列，避免后续流程丢失日期上下文。
+        if 'date' not in out.columns and isinstance(out.index, pd.MultiIndex) and 'date' in out.index.names:
+            out = out.reset_index()
+        elif 'date' not in out.columns and out.index.name == 'date':
+            out = out.reset_index()
+
         if 'gvkey' not in out.columns or 'weight' not in out.columns:
             raise ValueError("weights_df 必须包含 ['gvkey', 'weight'] 列")
 
@@ -414,7 +421,20 @@ class MLStockSelectionStrategy(BaseStrategy):
             return g
 
         if 'date' in out.columns:
-            out = out.groupby('date', group_keys=False).apply(_apply_group).reset_index(drop=True)
+            grouped_results = []
+            for dt, g in out.groupby('date', sort=False):
+                gg = _apply_group(g)
+                if gg.empty:
+                    continue
+                if 'date' not in gg.columns:
+                    gg = gg.copy()
+                    gg['date'] = dt
+                grouped_results.append(gg)
+
+            if grouped_results:
+                out = pd.concat(grouped_results, axis=0, ignore_index=True)
+            else:
+                out = out.iloc[0:0].copy()
         else:
             out = _apply_group(out).reset_index(drop=True)
 
